@@ -11,6 +11,24 @@ beside the conversation.
   <img src="docs/desktop.png" alt="The sidebar in the Claude Code tab of the desktop app" width="49%">
 </p>
 
+## Updates
+
+### Know what every session costs · v0.1.20
+
+On a subscription, see how much of your 5-hour and weekly limits a session
+used. On an API key, see it in dollars. The sidebar picks the right one for
+your plan automatically.
+
+<p align="center"><img src="docs/update-cost.png" alt="Tokens section on a subscription, showing 5-hour and weekly limit used, beside the API version showing cost in dollars"></p>
+
+### Tasks · v0.1.19
+
+Follow the agent's plan as it works: every task with a progress bar, a spinner
+and timer on the one running, ✓ when done and ✗ when it fails.
+
+<p align="center"><img src="docs/update-tasks.gif" alt="The Tasks section checking off tasks one by one, with a spinner and timer on the task in progress" width="720"></p>
+<p align="center"><sub><a href="docs/update-tasks.mp4">Watch in full quality</a></sub></p>
+
 ## Install
 
 ```sh
