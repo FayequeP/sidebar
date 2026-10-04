@@ -1,6 +1,6 @@
 /* @jsx h */
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
-import { failedTitle, applyTaskCreate, applyTaskUpdate, applyTodoWrite, resolveTtl, speed, formatElapsed, spinnerFrame, trackStarts, visibleTasks } from './register'
+import { formatShare, sessionShare, trackLimitUse, formatUsd, failedTitle, applyTaskCreate, applyTaskUpdate, applyTodoWrite, resolveTtl, speed, formatElapsed, spinnerFrame, trackStarts, visibleTasks } from './register'
 
 tier('user')
 
@@ -30,6 +30,7 @@ describe('register', () => {
       value: {
         context: { tokens: 85400, window: 272000, percent: 31 },
         rateLimits: [],
+        cost: { usd: 3.456 },
       },
     }))
     on('env.get', async () => ({ value: undefined }))
@@ -70,7 +71,7 @@ describe('register', () => {
     while (!step.done) step = await stream.next()
     await stream.result
 
-    const probes = [/^Context$/, /31\.4%/, /85\.4k/, /^Tokens$/, /Cache read/, /^Cache$/, /Expires in/, /^5m cache · API key$/, /[45]:[0-5][0-9]/, /^Speed$/, /First token/, /^Output$/, /^Workspace$/, /tps-meter/]
+    const probes = [/^Context$/, /31\.4%/, /85\.4k/, /^Tokens$/, /Cache read/, /^Cache$/, /Expires in/, /^5m cache · API key$/, /[45]:[0-5][0-9]/, /^Speed$/, /First token/, /^Output$/, /^Workspace$/, /tps-meter/, /^Cost$/, /^\$3\.46$/]
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({
         plugin: 'sidebar',
@@ -280,5 +281,88 @@ describe('register', () => {
     expect(failedTitle('Errors page cleanup')).toBeNull() // a word that merely starts with one
     expect(failedTitle('Fix failed builds')).toBeNull() // failure word not at the start
     expect(failedTitle('Create hello.py')).toBeNull()
+  })
+  test('cost reads in dollars at a glance', async () => {
+    expect([formatUsd(0), formatUsd(0.004), formatUsd(3.456), formatUsd(99.999), formatUsd(1234.5)]).toEqual([
+      '$0.00', '<$0.01', '$3.46', '$100', '$1,235',
+    ])
+  })
+  test("a subscriber sees this session's share of the limits", async () => {
+    let u = trackLimitUse(new Map(), [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 10 }])
+    u = trackLimitUse(u, [{ kind: 'five_hour', percentUsed: 49 }, { kind: 'seven_day', percentUsed: 12.5 }])
+    expect(sessionShare(u.get('five_hour')!)).toBe(9)
+    expect(sessionShare(u.get('seven_day')!)).toBe(2.5)
+    // the 5-hour window resets (49 -> 3): the 9 used before it is kept
+    u = trackLimitUse(u, [{ kind: 'five_hour', percentUsed: 3 }])
+    expect(sessionShare(u.get('five_hour')!)).toBe(12)
+    expect([formatShare(0), formatShare(0.04), formatShare(2.5), formatShare(12.4)]).toEqual(['0%', '<0.1%', '+2.5%', '+12%'])
+  })
+
+  test('subscribers get limit rows, API users get cost', async ($, on) => {
+    mock.clock(on)
+    mock.store(on, {})
+    let usage: any = { context: { tokens: 0, window: 200000 }, rateLimits: [], cost: { usd: 1.5 } }
+    on('session.usage', async () => ({ value: usage }))
+    on('env.get', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: 'C:\work' }))
+    const mount = () =>
+      $.ui.mount({ plugin: 'sidebar', surface: 'terminal', component: 'Pane', requestId: 'meter', props: PANE_PROPS })
+
+    const api = await mount()
+    expect(await api.find({ type: 'Text', text: /^\$1\.50$/ })).toBeDefined()
+    expect(await api.find({ type: 'Text', text: /limit/ })).toBeUndefined()
+    await api.unmount()
+
+    usage = { ...usage, rateLimits: [{ kind: 'five_hour', percentUsed: 20 }, { kind: 'seven_day', percentUsed: 5 }] }
+    const sub = await mount()
+    expect(await sub.find({ type: 'Text', text: /^5-hour limit$/ })).toBeDefined()
+    expect(await sub.find({ type: 'Text', text: /^Weekly limit$/ })).toBeDefined()
+    expect(await sub.find({ type: 'Text', text: /^Cost$/ })).toBeUndefined()
+    await sub.unmount()
+  })
+  test('CoVe: session-scoped totals, true hit rate, main-loop speed', async ($, on) => {
+    mock.clock(on)
+    // A previous session's totals are in the store: they must not carry over.
+    mock.store(on, { sums: { input: 9e6, output: 9e6, cacheRead: 9e6, cacheWrite: 9e6 }, session: 'old-session' })
+    on('session.id', async () => ({ value: 'new-session' }))
+    on('session.usage', async () => ({ value: { context: { tokens: 0, window: 200000 }, rateLimits: [] } }))
+    on('env.get', async () => ({ value: undefined }))
+    on('env.set', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: 'C:\work' }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('ui.open', async () => ({ value: { isPlaced: true } }))
+    on('ui.invalidate', async () => ({ value: undefined }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('command.register', async () => ({ value: undefined }))
+    const usage = { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 800, cache_creation_input_tokens: 100, model: 'm' }
+    on('turn.step', async function* ($, e) {
+      yield { kind: 'text', index: 0, text: 'hello' }
+      yield { kind: 'stop', stopReason: 'end_turn', usage }
+      return { turnId: e.turnId, index: e.index, answer: 'hello', toolUses: [], stopReason: 'end_turn', usage }
+    })
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:\work' })
+
+    // A subagent's reply: its tokens count, but not its speed or cache clock.
+    const drain = async (agentId?: string) => {
+      const st = $.turn.step({ turnId: 't', index: 0, model: 'm', messageCount: 1, ...(agentId ? { agentId } : {}) })
+      let r = await st.next()
+      while (!r.done) r = await st.next()
+      await st.result
+    }
+    await drain('sub-1')
+    const mount = () =>
+      $.ui.mount({ plugin: 'sidebar', surface: 'terminal', component: 'Pane', requestId: 'meter', props: PANE_PROPS })
+    let ui = await mount()
+    expect(['/^100$/', !!(await ui.find({ type: 'Text', text: /^100$/ }))]).toEqual(['/^100$/', true]) // input: this session only, not 9M
+    expect(['/^80\\.0%$/', !!(await ui.find({ type: 'Text', text: /^80\.0%$/ }))]).toEqual(['/^80\\.0%$/', true]) // 800 / (800 + 100 + 100)
+    expect(['/^—$/', !!(await ui.find({ type: 'Text', text: /^—$/ }))]).toEqual(['/^—$/', true]) // no main reply yet: no expiry, no first token
+    expect(['/^0ms$/', !!(await ui.find({ type: 'Text', text: /^0ms$/ }))]).toEqual(['/^0ms$/', false])
+    await ui.unmount()
+
+    await drain() // the main conversation's reply starts the clock
+    ui = await mount()
+    // the countdown now runs (the test kit's clock does not move, so no exact time)
+    expect(!!(await ui.find({ type: 'Text', text: /^[45]:[0-5][0-9]$/ }))).toBe(true)
+    await ui.unmount()
   })
 })

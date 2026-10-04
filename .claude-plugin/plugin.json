@@ -1,6 +1,6 @@
 {
   "name": "sidebar",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Shows the model's real output speed, token and prompt-cache stats in a docked sidebar beside the transcript.",
   "author": { "name": "Fayeque Peerzade" },
   "license": "MIT",

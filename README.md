@@ -35,8 +35,8 @@ the prompt.
 |---|---|
 | **Tasks** | The agent's to-do list: a progress bar and every task, marked ✓ done, a spinner and timer while in progress, ○ not started, or ✗ failed (Claude marks a failed task done with a title like `FAILED: …`). Hidden when there's no list |
 | **Context** | How full the context window is, as a bar and `85.4k / 272k` |
-| **Tokens** | Input, output, cache read, cache write and the session total |
-| **Cache** | Hit rate, and a countdown to when the prompt cache expires |
+| **Tokens** | This session's input (uncached), output, cache read, cache write and total, subagents included, then what this session spent: on a subscription, how much of your **5-hour** and **weekly** limits it used (e.g. `+9%`); on an API key, its **cost** in dollars, as `/cost` reports it |
+| **Cache** | Hit rate (share of all input served from the cache), and a countdown to when the main conversation's prompt cache expires |
 | **Speed** | Time to first token and output speed in tokens per second |
 | **Workspace** | Folder, git branch, clean or changed, lines added and removed |
 
@@ -78,7 +78,8 @@ default of 38 columns.
 <summary><b>Output speed</b></summary>
 
 Output tokens divided by the time from the first streamed piece of the response
-to the last one. Text, thinking and tool-call arguments all count. Token counts
+to the last one, for the main conversation only (a subagent may run another
+model). Text, thinking and tool-call arguments all count. Token counts
 come from the API's `usage.output_tokens`; while a response is still
 streaming, a live estimate of about 4 characters per token is shown instead.
 

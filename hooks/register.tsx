@@ -1,12 +1,12 @@
 /* @jsx h */
 import type { Register } from 'claude-code'
 
-// ---- model speed + prompt-cache meter, drawn as a docked sidebar ----
-// TPS  = output tokens / the time the response was streaming (first token to
-//        the last one). TTFT = request sent -> first token. Cache rows come
-//        from the API's usage fields on every step. The "Valid for" countdown
-//        is the main-conversation prompt-cache TTL (5m or 1h) minus the wall
-//        time since the last response finished.
+// ---- stats sidebar: everything is this session's ----
+// Token rows sum the API's usage over every response this session (subagents
+// included: they are spend too). Speed, first token and the cache countdown
+// follow the main conversation only: a subagent runs its own model and its own
+// prompt cache. The countdown is the main conversation's cache TTL minus the
+// time since its last request was sent (when the cache was last used).
 
 type Stats = { tps: number; ttftMs: number | null; isWarmingUp?: boolean }
 type Last = Stats & { at: number }
@@ -26,10 +26,11 @@ let git: {
   changed: number
   added: number
   removed: number
-  tracked: number
 } | null = null
 let gitAt = 0
+let sessionId = ''
 let taskStarts = new Map<string, number>() // in-progress task key -> when it started
+let limitUse = new Map<string, LimitUse>() // per window kind: what this session has used
 let tasks: Task[] = [] // the main conversation's task list, as its task tools last left it
 
 const round1 = (n: number) => Math.round(n * 10) / 10
@@ -130,8 +131,10 @@ async function pollGit($: any): Promise<void> {
   try {
     const branchRun = await $.process.run(['git', 'branch', '--show-current'], { timeoutMs: 3000 })
     const statusRun = await $.process.run(['git', 'status', '--porcelain'], { timeoutMs: 3000 })
-    const diffRun = await $.process.run(['git', 'diff', '--numstat'], { timeoutMs: 3000 })
-    const counts = await $.process.run(['git', 'ls-files'], { timeoutMs: 3000 })
+    // Staged and unstaged edits against HEAD, so Lines agrees with Status after
+    // a `git add`. A repo with no commit yet has no HEAD: compare the index then.
+    let diffRun = await $.process.run(['git', 'diff', 'HEAD', '--numstat'], { timeoutMs: 3000 })
+    if (diffRun.exitCode !== 0) diffRun = await $.process.run(['git', 'diff', '--cached', '--numstat'], { timeoutMs: 3000 })
     if (branchRun.exitCode !== 0) {
       git = null // not a repo: the sidebar shows its empty state
       return
@@ -148,17 +151,17 @@ async function pollGit($: any): Promise<void> {
         removed += Number(parts[1])
       }
     }
-    const tracked =
-      counts.exitCode === 0 ? String(counts.stdout).split('\n').filter(l => l.trim().length > 0).length : 0
-    git = { branch, dirty: statusLines.length > 0, changed: statusLines.length, added, removed, tracked }
+    git = { branch, dirty: statusLines.length > 0, changed: statusLines.length, added, removed }
   } catch {
     // not a repo or git missing: keep last known
   }
 }
 
+// Share of all input served from the cache: uncached input counts against it
+// as much as cache writes do.
 function hitRate(): number | null {
-  const { cacheRead, cacheWrite } = sums
-  const total = cacheRead + cacheWrite
+  const { cacheRead, cacheWrite, input } = sums
+  const total = cacheRead + cacheWrite + input
   return total > 0 ? cacheRead / total : null
 }
 
@@ -176,13 +179,20 @@ export const register: Register = on => {
       // no env access: the sidebar still opens, Tasks just stays hidden
     }
     const result = await next(e)
+    limitUse = new Map() // a new session counts its share of the limits from here
 
-    // Rehydrate previous-session counters.
-    const [stored, storedSums] = await Promise.all([
+    // Counters are this session's. Start from zero, and pick saved ones back up
+    // only for this same session (a resume or a plugin reload), never another's.
+    sums = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    last = null
+    sessionId = await $.session.id().catch(() => '')
+    const [stored, storedSums, storedFor] = await Promise.all([
       $.store.get('last').catch(() => undefined),
       $.store.get('sums').catch(() => undefined),
+      $.store.get('session').catch(() => undefined),
     ])
-    if (stored && typeof stored === 'object') {
+    const isSameSession = sessionId !== '' && storedFor === sessionId
+    if (isSameSession && stored && typeof stored === 'object') {
       const s = stored as { tps?: unknown; ttftMs?: unknown; at?: unknown }
       if (typeof s.tps === 'number' && Number.isFinite(s.tps)) {
         last = {
@@ -192,7 +202,7 @@ export const register: Register = on => {
         }
       }
     }
-    if (storedSums && typeof storedSums === 'object') {
+    if (isSameSession && storedSums && typeof storedSums === 'object') {
       const s = storedSums as Sums
       for (const k of ['input', 'output', 'cacheRead', 'cacheWrite'] as const) {
         if (typeof s[k] === 'number' && Number.isFinite(s[k])) sums[k] = s[k]
@@ -262,6 +272,7 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    const isMain = !e.agentId // speed and the cache clock are the main conversation's
     const startedAt = await $.clock.now()
     let firstTokenAt: number | null = null
     let lastTokenAt: number | null = null
@@ -273,7 +284,7 @@ export const register: Register = on => {
         // tool-call arguments (a file the model writes streams as `input`).
         const piece =
           chunk.kind === 'text' || chunk.kind === 'thinking' ? chunk.text : chunk.kind === 'input' ? chunk.json : null
-        if (piece !== null) {
+        if (piece !== null && isMain) {
           const now = await $.clock.now()
           if (firstTokenAt === null) firstTokenAt = now
           lastTokenAt = now
@@ -292,7 +303,6 @@ export const register: Register = on => {
     }
 
     const result = await stream.result
-    const endedAt = await $.clock.now()
     const usage = result.usage
     if (usage) {
       sums = {
@@ -304,15 +314,18 @@ export const register: Register = on => {
       $.store.set('sums', sums).catch(err => {
         $.ui.log(`sidebar: store write failed: ${err}`)
       })
+      $.store.set('session', sessionId).catch(() => undefined)
     }
-    if (usage || chars > 0) {
-      // A response arrived: the cache clock restarts whether or not the
-      // speed reading below is trustworthy.
+    if (isMain && (usage || chars > 0)) {
+      // A main-conversation response arrived: the cache clock restarts whether
+      // or not the speed reading below is trustworthy.
       const tps = firstTokenAt === null ? null : speed(usage?.output_tokens ?? Math.round(chars / 4), firstTokenAt, lastTokenAt!)
       last = {
         tps: tps ?? last?.tps ?? 0,
         ttftMs: firstTokenAt === null ? (last?.ttftMs ?? null) : firstTokenAt - startedAt,
-        at: endedAt,
+        // The cache was last used when this request was read, not when the
+        // reply finished: counting from the end would overstate time left.
+        at: startedAt,
       }
       $.store.set('last', last).catch(err => {
         $.ui.log(`sidebar: store write failed: ${err}`)
@@ -338,10 +351,13 @@ export const register: Register = on => {
     // CONTEXT figures from the session usage (same source as the status line).
     let contextPct: number | null = null
     let contextLine = '— / —'
-    let rateLimits: { percentUsed: number }[] = []
+    let rateLimits: { kind: string; percentUsed: number }[] = []
+    let costUsd: number | undefined
     try {
       const usage = await $.session.usage()
       rateLimits = usage?.rateLimits ?? []
+      costUsd = usage?.cost?.usd
+      limitUse = trackLimitUse(limitUse, rateLimits)
       if (usage && usage.context && usage.context.window) {
         const used = usage.context.tokens ?? 0
         contextPct = used / usage.context.window
@@ -444,6 +460,17 @@ export const register: Register = on => {
           <Text>Total</Text>
           <Text bold>{compact(sums.input + sums.output + sums.cacheRead + sums.cacheWrite)}</Text>
         </Box>
+        {/* What this session spent, in the unit the person pays in: a share of
+            the plan's limits on a subscription, dollars on an API key. */}
+        {rateLimits.length > 0 ? (
+          <Box flexDirection="column" width="100%">
+            {LIMIT_ROWS.filter(([kind]) => limitUse.has(kind)).map(([kind, label]) => (
+              <Row key={`limit-${kind}`} label={label} value={formatShare(sessionShare(limitUse.get(kind)!))} el={el} />
+            ))}
+          </Box>
+        ) : costUsd !== undefined && costUsd > 0 ? ( // > 0: before the first reply, a subscriber has no readings yet
+          <Row label="Cost" value={formatUsd(costUsd)} el={el} />
+        ) : undefined}
         {gap}
 
         <Title label="Cache" el={el} />
@@ -673,4 +700,48 @@ export function trackStarts(list: Task[], prev: Map<string, number>, now: number
   const next = new Map<string, number>()
   for (const t of list) if (t.status === 'in_progress') next.set(taskKey(t), prev.get(taskKey(t)) ?? now)
   return next
+}
+
+// $0.004 -> <$0.01, $3.456 -> $3.46, $1234.5 -> $1,235
+export function formatUsd(usd: number): string {
+  if (usd > 0 && usd < 0.01) return '<$0.01'
+  const cents = Math.round(usd * 100) / 100 // $99.999 is $100, so whole dollars
+  if (cents < 100) return `$${cents.toFixed(2)}`
+  return `$${Math.round(usd).toLocaleString('en-US')}`
+}
+
+// ---- This session's share of the plan's limits (subscriptions) ----
+// Claude Code reports each window's % used for the whole account. The first
+// reading this session is the baseline; what it has climbed since is this
+// session's share. When a window resets the % drops: bank what was used before
+// the reset and count on from 0. ponytail: the baseline arrives after the first
+// reply, so that reply goes uncounted, and use elsewhere on the account in the
+// same window counts here too; Claude Code reports nothing finer.
+type LimitUse = { base: number; last: number; banked: number }
+const LIMIT_ROWS = [
+  ['five_hour', '5-hour limit'],
+  ['seven_day', 'Weekly limit'],
+] as const
+
+export function trackLimitUse(
+  prev: Map<string, LimitUse>,
+  readings: { kind: string; percentUsed: number }[],
+): Map<string, LimitUse> {
+  const next = new Map(prev)
+  for (const { kind, percentUsed: p } of readings) {
+    const u = prev.get(kind)
+    if (!u) next.set(kind, { base: p, last: p, banked: 0 })
+    else if (p < u.last) next.set(kind, { base: 0, last: p, banked: u.banked + (u.last - u.base) }) // window reset
+    else next.set(kind, { ...u, last: p })
+  }
+  return next
+}
+
+export const sessionShare = (u: LimitUse) => u.banked + (u.last - u.base)
+
+// +9%, +0.4%, <0.1%, 0%
+export function formatShare(pct: number): string {
+  if (pct <= 0) return '0%'
+  if (pct < 0.1) return '<0.1%'
+  return `+${pct < 10 ? +pct.toFixed(1) : Math.round(pct)}%`
 }

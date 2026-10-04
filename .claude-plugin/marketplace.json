@@ -7,7 +7,7 @@
       "name": "sidebar",
       "source": "./",
       "description": "Shows the model's actual TPS, TTFT and token/cache stats in a docked sidebar. Requires function hooks (early access) and an interactive terminal.",
-      "version": "0.1.19",
+      "version": "0.1.20",
       "keywords": ["function-hooks", "tps", "ttft"]
     }
   ]
